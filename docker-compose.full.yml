@@ -1,0 +1,81 @@
+# Full build: real STT + OCR + LLM + yt-dlp.
+# Requires .env with LLM_API_KEY / LLM_BASE_URL / LLM_MODEL.
+#
+# Usage:
+#   cp .env.example .env  # then edit .env with real LLM credentials
+#   # The Whisper model baked into the image is small (~460 MB) — see
+#   # WHISPER_PRELOAD_MODELS below for how to bake medium as well.
+#   docker compose -f docker-compose.full.yml up --build
+#   curl http://127.0.0.1:8000/health
+#   # upload a video:
+#   curl -X POST http://127.0.0.1:8000/extract/upload -F 'file=@data/input_videos/pasta.mp4'
+#
+# NOTE: model caches (HuggingFace ~460 MB for Whisper, PaddleOCR ~80 MB per
+# language) live in named volumes, so they survive `docker compose down`,
+# container recreation and image rebuilds. On the first `up` Docker copies the
+# models preloaded at build time into the volumes; after that nothing is
+# re-downloaded. The volumes are deleted only by `docker compose down -v` or
+# `docker volume rm`. CAVEAT: the copy-on-first-`up` happens only into an EMPTY
+# volume — if you bake extra models later (WHISPER_PRELOAD_MODELS), an already
+# filled volume is not extended; wipe it (`down -v`) or accept a one-time
+# runtime download of the missing model.
+services:
+  api:
+    build:
+      context: .
+      args:
+        BUILD_MODE: full
+        # Two independent Whisper knobs — the names sound similar, the roles differ:
+        #
+        # WHISPER_PRELOAD_MODELS (below) = what gets PUT INSIDE the image at
+        #   build time. A baked model starts instantly and works offline;
+        #   each baked model costs image size (~460 MB small, ~1.5 GB medium).
+        #
+        # WHISPER_MODEL (below) = which model RUNS. The .env value wins
+        #   (env_file overrides the image ENV); the value below is only the
+        #   image fallback for when .env omits the variable.
+        #   Running a model that was NOT baked: it downloads ONCE at the first
+        #   request into the hf-cache volume and survives restarts — no rebuild.
+        #
+        # Current setup = the original behaviour: bake small, run small.
+        WHISPER_MODEL: small
+        # Build-time bake list (see above). "small" keeps the image as light as
+        # before. To also bake medium (+~1.5 GB image, slower build, ~2.5-3x
+        # slower CPU inference) set it to "small medium".
+        WHISPER_PRELOAD_MODELS: "small"
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Model caches (Whisper + PaddleOCR) live in named volumes, so they
+      # outlive the container: restarts and rebuilds never re-download them.
+      # On the first `up` with an EMPTY volume, Docker copies in whatever the
+      # image keeps at that path — that's why the mountpoints are pre-created
+      # in the Dockerfile as appuser: the copied files belong to appuser and
+      # stay writable (a mountpoint missing from the image would be created
+      # root-owned, and the first model download would fail).
+      # After that the volume changes only from inside the app (e.g. the
+      # one-time download of a non-baked model). See NOTE at the top of this
+      # file: an already-filled volume is NOT extended by a rebuild.
+      - hf-cache:/home/appuser/.cache/huggingface
+      - paddleocr-cache:/home/appuser/.paddleocr
+      - paddlex-cache:/home/appuser/.paddlex
+      # YouTube cookies (bot check): put cookies.txt next to this file,
+      # uncomment the mount and set YTDLP_COOKIES_FILE=/cookies.txt in .env.
+      # Cookies are account credentials — keep the file out of git.
+      # NOTE: mount WITHOUT ":ro" — yt-dlp rewrites the file on every run
+      # (close() → save_cookies()), even when extraction failed; with a
+      # read-only mount the run ends with a raw PermissionError traceback.
+      - ./cookies.txt:/cookies.txt
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  hf-cache:
+  paddleocr-cache:
+  paddlex-cache:

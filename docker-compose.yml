@@ -1,13 +1,43 @@
+# Slim build (default): /health + tests only, no ML models.
+# Use this for local development, CI, and contract validation.
 services:
   api:
-    build: .
+    build:
+      context: .
+      args:
+        BUILD_MODE: slim
     ports:
       - "127.0.0.1:8000:8000"
     env_file:
       - .env
+    volumes:
+      # Slim has no preloaded models: Whisper/PaddleOCR download at the first
+      # real request. Named volumes keep those caches across `down`/`up` so
+      # they are downloaded only once. Mountpoints are pre-created in the
+      # image (see Dockerfile) so the volumes inherit appuser ownership.
+      - hf-cache:/home/appuser/.cache/huggingface
+      - paddleocr-cache:/home/appuser/.paddleocr
+      - paddlex-cache:/home/appuser/.paddlex
+      # YouTube cookies (bot check): put cookies.txt next to this file,
+      # uncomment the mount and set YTDLP_COOKIES_FILE=/cookies.txt in .env.
+      # Cookies are account credentials — keep the file out of git.
+      # NOTE: mount WITHOUT ":ro" — yt-dlp rewrites the file on every run
+      # (close() → save_cookies()), even when extraction failed; with a
+      # read-only mount the run ends with a raw PermissionError traceback.
+      - ./cookies.txt:/cookies.txt
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
       interval: 10s
       timeout: 3s
       retries: 3
       start_period: 10s
+
+# Real extraction:
+#   docker compose -f docker-compose.full.yml up --build
+# (or override: `docker compose build --build-arg BUILD_MODE=full && docker compose up`)
+# Full image installs requirements-ml.txt. Requires LLM_API_KEY etc. in .env.
+
+volumes:
+  hf-cache:
+  paddleocr-cache:
+  paddlex-cache:
