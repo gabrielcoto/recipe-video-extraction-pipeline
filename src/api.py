@@ -4,7 +4,8 @@ import shutil
 from tempfile import TemporaryDirectory
 from typing import Annotated
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, HttpUrl
 
 from src import pipeline
@@ -27,16 +28,41 @@ _ERROR_RESPONSES = {
     400: {"description": "empty_file, video_too_long, unsupported_platform, ssrf_blocked, video_unreadable"},
     413: {"description": "file_too_large"},
     422: {"description": "no_usable_content или стандартная ошибка валидации тела"},
-    500: {"description": "media_processing_failed, ocr_failed, internal_error"},
+    500: {"description": "media_processing_failed, ocr_failed, downloader_unavailable, internal_error"},
     502: {"description": "download_failed, llm_unavailable, llm_invalid_response"},
     503: {"description": "model_unavailable"},
 }
+
+# Multipart-тело больше самого файла на границы и заголовки частей;
+# точную границу по файлу проверяет file.size.
+_UPLOAD_REJECT_MARGIN_BYTES = 64 * 1024
 
 
 class ExtractRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     url: HttpUrl
+
+
+@app.middleware("http")
+async def reject_oversized_upload_before_body(request: Request, call_next):
+    # file.size заполняется при разборе multipart: без этой проверки 413
+    # уходит только после получения всего тела. Content-Length считает тело
+    # вместе с границами multipart, поэтому порог с запасом; единственная
+    # точная граница — file.size (chunked и заниженные заголовки — тоже).
+    if request.method == "POST" and request.url.path == "/extract/upload":
+        content_length = request.headers.get("content-length", "")
+        limit_with_margin = MAX_UPLOAD_BYTES + _UPLOAD_REJECT_MARGIN_BYTES
+        if content_length.isdigit() and int(content_length) > limit_with_margin:
+            limit_mib = MAX_UPLOAD_BYTES / (1024 * 1024)
+            return JSONResponse(
+                status_code=413,
+                content={"detail": {
+                    "code": "file_too_large",
+                    "message": f"Файл должен быть не больше {limit_mib:g} MiB",
+                }},
+            )
+    return await call_next(request)
 
 
 @app.get("/health")

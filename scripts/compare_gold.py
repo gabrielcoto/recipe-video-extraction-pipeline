@@ -11,6 +11,14 @@
 #   - отсутствующее поле и поле со значением null различаются
 #     (если иная нормализация не согласована — см. --absent-equals-null).
 #
+# Отличие от наивного раскрытия: ингредиенты сопоставляются ПО ИМЕНИ, а не по
+# позиции списка (регистр и пробелы не важны; дубликаты — по порядку; остатки —
+# по уникальному вхождению подстрокой: «мука» ⊂ «пшеничная мука»; при двух и
+# более кандидатах пара не составляется). Пропущенный или лишний ингредиент
+# стоит ровно своих полей и не сдвигает пары остальных. Поля свободной формы
+# (--skip-notes, --skip-instructions) исключаются из метрики — их качество
+# оценивается вручную (docs/real-testing.md, п. 4).
+#
 # Примеры:
 #   # Проверить файлы эталонов на соответствие контракту Recipe 1.0.0:
 #   python scripts/compare_gold.py --validate-only data/expected_outputs/*.json
@@ -18,8 +26,9 @@
 #   # Оценить один прогон против эталона:
 #   python scripts/compare_gold.py data/expected_outputs/pasta.json run_pasta.json
 #
-#   # Исключить поддерево из оценки и считать null равным отсутствующему полю:
-#   python scripts/compare_gold.py --exclude /source --absent-equals-null gold.json result.json
+#   # Пресет реальной проверки (docs/real-testing.md, п. 4):
+#   python scripts/compare_gold.py --exclude /source --absent-equals-null \
+#       --skip-notes --skip-instructions gold.json result.json
 #
 # Коды выхода: 0 — порог достигнут (или все файлы валидны);
 #              1 — порог не достигнут / есть ошибки валидации;
@@ -30,10 +39,14 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 from pathlib import Path
 
 DEFAULT_THRESHOLD = 0.8  # рубрика: не менее 80% для каждого видео
+
+_INSTRUCTION_POINTER = re.compile(r"^/steps/\d+/instruction$")
+_INDEXED_INGREDIENT_EXCLUDE = re.compile(r"^/ingredients/\d+($|/)")
 
 
 def escape_token(token: str) -> str:
@@ -68,15 +81,11 @@ def _equal(left, right) -> bool:
     return left == right
 
 
-def compare(gold: dict, result: dict, excludes: tuple[str, ...] = (), absent_equals_null: bool = False) -> dict:
-    gold_paths = {p: v for p, v in flatten(gold).items() if not _excluded(p, excludes)}
-    result_paths = {p: v for p, v in flatten(result).items() if not _excluded(p, excludes)}
-    union = sorted(set(gold_paths) | set(result_paths))
-    if not union:
-        raise ValueError("Объединение путей пусто — сравнивать нечего")
+def _compare_path_maps(gold_paths: dict, result_paths: dict, absent_equals_null: bool) -> tuple[int, list[dict]]:
+    """Общая сверка двух карт «указатель → значение»: совпадения и расхождения."""
     matches = 0
     diffs: list[dict] = []
-    for pointer in union:
+    for pointer in sorted(set(gold_paths) | set(result_paths)):
         in_gold, in_result = pointer in gold_paths, pointer in result_paths
         if in_gold and in_result:
             if _equal(gold_paths[pointer], result_paths[pointer]):
@@ -95,10 +104,136 @@ def compare(gold: dict, result: dict, excludes: tuple[str, ...] = (), absent_equ
                 matches += 1
             else:
                 diffs.append({"pointer": pointer, "status": "extra_in_result", "result": result_paths[pointer]})
+    return matches, diffs
+
+
+def _ingredient_list(doc) -> list[dict]:
+    ings = doc.get("ingredients") if isinstance(doc, dict) else None
+    if not ings:
+        return []
+    if not isinstance(ings, list) or any(not isinstance(item, dict) for item in ings):
+        raise ValueError("ingredients должны быть списком объектов — проверьте документы контрактом")
+    return ings
+
+
+def _norm_name(ingredient: dict) -> str:
+    name = ingredient.get("name")
+    if not isinstance(name, str):
+        raise ValueError("у каждого ингредиента должно быть строковое поле name — проверьте документы контрактом")
+    return name.strip().casefold()
+
+
+def _ingredient_paths(ingredient: dict, skip_notes: bool) -> dict:
+    """Раскрывает один ингредиент в относительные указатели («/name», «/quantity/value», …)."""
+    paths = flatten(ingredient)
+    if skip_notes:
+        paths = {p: v for p, v in paths.items() if p != "/note"}
+    return paths
+
+
+def _pair_ingredients(gold_ings: list[dict], result_ings: list[dict]) -> tuple[list[tuple[int, int]], list[int], list[int]]:
+    """Сопоставляет ингредиенты по имени, а не по позиции списка.
+
+    1) точное совпадение нормализованных имён (регистр и пробелы не важны),
+       дубликаты — по порядку;
+    2) остатки — уникальное вхождение одного имени в другое как подстроки;
+       при двух и более кандидатах пара не составляется: сомнительное
+       сопоставление остаётся в расхождениях, а не прячется.
+    Возвращает (пары (i, j), неверифицированные индексы эталона, результата).
+    """
+    gold_keys = [_norm_name(ing) for ing in gold_ings]
+    result_keys = [_norm_name(ing) for ing in result_ings]
+    result_by_name: dict[str, list[int]] = {}
+    for j, key in enumerate(result_keys):
+        result_by_name.setdefault(key, []).append(j)
+    pairs: list[tuple[int, int]] = []
+    used_result: set[int] = set()
+    for i, key in enumerate(gold_keys):
+        queue = result_by_name.get(key)
+        if queue:
+            j = queue.pop(0)
+            used_result.add(j)
+            pairs.append((i, j))
+    paired_gold = {i for i, _ in pairs}
+    gold_left = [i for i in range(len(gold_ings)) if i not in paired_gold]
+    result_left = [j for j in range(len(result_ings)) if j not in used_result]
+    for i in list(gold_left):
+        candidates = [
+            j for j in result_left
+            if gold_keys[i] and result_keys[j]
+            and (gold_keys[i] in result_keys[j] or result_keys[j] in gold_keys[i])
+        ]
+        if len(candidates) == 1:
+            j = candidates[0]
+            pairs.append((i, j))
+            gold_left.remove(i)
+            result_left.remove(j)
+    return pairs, gold_left, result_left
+
+
+def compare(gold: dict, result: dict, excludes: tuple[str, ...] = (), absent_equals_null: bool = False,
+            skip_notes: bool = False, skip_instructions: bool = False) -> dict:
+    gold_flat = flatten(gold)
+    result_flat = flatten(result)
+    if skip_instructions:
+        # Тексты шагов — свободная форма, точное совпадение строк наказывало бы
+        # перефразирование; их качество оценивается вручную (real-testing.md, п. 4).
+        gold_flat = {p: v for p, v in gold_flat.items() if not _INSTRUCTION_POINTER.match(p)}
+        result_flat = {p: v for p, v in result_flat.items() if not _INSTRUCTION_POINTER.match(p)}
+
+    matches = 0
+    diffs: list[dict] = []
+
+    # Ингредиенты: пары по имени. Указатели расхождений строятся от имени
+    # (/ingredients/Соль/quantity/value), поэтому --exclude работает и здесь.
+    gold_ings = _ingredient_list(gold)
+    result_ings = _ingredient_list(result)
+    gold_ings_paths = [_ingredient_paths(ing, skip_notes) for ing in gold_ings]
+    result_ings_paths = [_ingredient_paths(ing, skip_notes) for ing in result_ings]
+    pairs, gold_left, result_left = _pair_ingredients(gold_ings, result_ings)
+    for i, j in sorted(pairs):
+        base = f"/ingredients/{escape_token(gold_ings[i]['name'])}"
+        matches += 1  # /name: совпадение по построению — пара найдена по имени
+        gold_pair = {f"{base}{p}": v for p, v in gold_ings_paths[i].items()
+                     if p != "/name" and not _excluded(f"{base}{p}", excludes)}
+        result_pair = {f"{base}{p}": v for p, v in result_ings_paths[j].items()
+                       if p != "/name" and not _excluded(f"{base}{p}", excludes)}
+        part, part_diffs = _compare_path_maps(gold_pair, result_pair, absent_equals_null)
+        matches += part
+        diffs.extend(part_diffs)
+    for i in gold_left:
+        base = f"/ingredients/{escape_token(gold_ings[i]['name'])}"
+        for p, v in sorted(gold_ings_paths[i].items()):
+            pointer = f"{base}{p}"
+            if _excluded(pointer, excludes):
+                continue
+            diffs.append({"pointer": pointer, "status": "missing_in_result", "gold": v})
+    for j in result_left:
+        base = f"/ingredients/{escape_token(result_ings[j]['name'])}"
+        for p, v in sorted(result_ings_paths[j].items()):
+            pointer = f"{base}{p}"
+            if _excluded(pointer, excludes):
+                continue
+            diffs.append({"pointer": pointer, "status": "extra_in_result", "result": v})
+
+    # Всё остальное — прежняя сверка по указателям (включая «/ingredients»
+    # пустого списка: у несоставленного списка нет элементов для пар).
+    rest_gold = {p: v for p, v in gold_flat.items()
+                 if not p.startswith("/ingredients/") and not _excluded(p, excludes)}
+    rest_result = {p: v for p, v in result_flat.items()
+                   if not p.startswith("/ingredients/") and not _excluded(p, excludes)}
+    rest_matches, rest_diffs = _compare_path_maps(rest_gold, rest_result, absent_equals_null)
+    matches += rest_matches
+    diffs.extend(rest_diffs)
+
+    diffs.sort(key=lambda d: d["pointer"])
+    total = matches + len(diffs)
+    if not total:
+        raise ValueError("Объединение путей пусто — сравнивать нечего")
     return {
         "matches": matches,
-        "total": len(union),
-        "ratio": matches / len(union),
+        "total": total,
+        "ratio": matches / total,
         "diffs": diffs,
     }
 
@@ -139,14 +274,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("paths", nargs="+", help="эталон и результат (оценка) или файлы эталонов (--validate-only)")
     parser.add_argument("--validate-only", action="store_true", help="только проверить файлы контракту, без оценки")
     parser.add_argument("--exclude", action="append", default=[], metavar="POINTER",
-                        help="исключить поддерево из оценки, например /source (можно повторять)")
+                        help="исключить поддерево из оценки, например /source (можно повторять); "
+                        "для ингредиентов путь строится от имени: /ingredients/соль/note")
     parser.add_argument("--absent-equals-null", action="store_true",
                         help="считать null и отсутствующее поле совпадением (согласованная нормализация)")
+    parser.add_argument("--skip-notes", action="store_true",
+                        help="исключить note ингредиентов из метрики (свободная форма, оценивается вручную)")
+    parser.add_argument("--skip-instructions", action="store_true",
+                        help="исключить тексты шагов из метрики (свободная форма, оценивается вручную)")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
                         help=f"порог совпадения, по умолчанию {DEFAULT_THRESHOLD}")
     parser.add_argument("--json", action="store_true", help="машинночитаемый вывод (один JSON-объект)")
     parser.add_argument("--no-validate", action="store_true", help="не проверять документы контракту перед оценкой")
     args = parser.parse_args(argv)
+
+    for root in args.exclude:
+        if _INDEXED_INGREDIENT_EXCLUDE.match(root):
+            print("ВНИМАНИЕ: индексные исключения /ingredients/<i>/... больше не действуют — "
+                  "ингредиенты сопоставляются по имени, а не по позиции. Для note используйте "
+                  "--skip-notes, для конкретного ингредиента — путь от имени (/ingredients/соль/note).",
+                  file=sys.stderr)
 
     if args.validate_only:
         failures = 0
@@ -183,7 +330,8 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     try:
-        report = compare(gold_doc, result_doc, tuple(args.exclude), args.absent_equals_null)
+        report = compare(gold_doc, result_doc, tuple(args.exclude), args.absent_equals_null,
+                         args.skip_notes, args.skip_instructions)
     except ValueError as exc:
         print(f"FAIL {exc}", file=sys.stderr)
         return 2

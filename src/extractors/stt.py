@@ -1,5 +1,6 @@
 # STT: ffmpeg извлекает моно-PCM 16 кГц, faster-whisper распознаёт речь.
 # Видео без аудиодорожки — не ошибка: расшифровка пустая, рецепт собирается по OCR.
+import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -8,16 +9,28 @@ from src.config import WHISPER_COMPUTE_TYPE, WHISPER_DEVICE, WHISPER_LANGUAGE, W
 from src.errors import MediaProcessingError, ModelUnavailableError
 
 _MODEL = None
+# FastAPI исполняет sync-обработчики в threadpool: ленивая загрузка —
+# под блокировкой, иначе модель создаётся по разу на каждый первый запрос.
+_MODEL_LOCK = threading.Lock()
 
 
 def _get_model():
     global _MODEL
-    if _MODEL is None:
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError as exc:
-            raise ModelUnavailableError("STT-модель не установлена: pip install faster-whisper") from exc
-        _MODEL = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
+    if _MODEL is None:  # быстрый путь без захвата блокировки
+        with _MODEL_LOCK:
+            if _MODEL is None:
+                try:
+                    from faster_whisper import WhisperModel
+                except ImportError as exc:
+                    raise ModelUnavailableError("STT-модель не установлена: pip install faster-whisper") from exc
+                try:
+                    _MODEL = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE_TYPE)
+                except Exception as exc:
+                    # Сбой загрузки — проблема окружения, а не входа:
+                    # 503 model_unavailable, как у OCR.
+                    raise ModelUnavailableError(
+                        f"Не удалось загрузить STT-модель {WHISPER_MODEL!r}: {exc}"
+                    ) from exc
     return _MODEL
 
 

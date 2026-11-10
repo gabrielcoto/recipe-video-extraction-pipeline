@@ -239,13 +239,14 @@ def test_yt_dlp_command_default_has_no_auth_flags():
 
 def test_yt_dlp_command_passes_cookies_file_and_player_client(monkeypatch):
     # Cookies-файл и клиент плеера попадают в оба вызова yt-dlp (метаданные и
-    # скачивание используют один и тот же сборщик команды).
-    monkeypatch.setattr(downloader, "YTDLP_COOKIES_FILE", "/run/secrets/cookies.txt")
+    # скачивание используют один и тот же сборщик команды). cookies_file —
+    # ЛИЧНАЯ копия из _private_cookies_file, а не общий YTDLP_COOKIES_FILE:
+    # yt-dlp перезаписывает cookiefile при выходе, общая запись — гонка.
     monkeypatch.setattr(downloader, "YTDLP_COOKIES_FROM_BROWSER", "")
     monkeypatch.setattr(downloader, "YTDLP_PLAYER_CLIENT", "tv,web_safari")
-    command = downloader._yt_dlp_command("-J", VIDEO_URL)
+    command = downloader._yt_dlp_command("-J", VIDEO_URL, cookies_file="/tmp/fropti-cookies-ab12cd34/cookies.txt")
     i = command.index("--cookies")
-    assert command[i + 1] == "/run/secrets/cookies.txt"
+    assert command[i + 1] == "/tmp/fropti-cookies-ab12cd34/cookies.txt"
     j = command.index("--extractor-args")
     assert command[j + 1] == "youtube:player_client=tv,web_safari"
     assert "--cookies-from-browser" not in command
@@ -308,10 +309,9 @@ def test_stderr_excerpt_expands_limit_for_traceback():
 
 
 def test_probe_duration_without_platform_duration_is_client_error(monkeypatch):
-    # Регрессия: платформа ответила метаданными без duration (yt-dlp вернул
-    # null) — это 400 video_unreadable (нельзя подтвердить лимит 180 секунд),
-    # а не 502 download_failed: сетевого сбоя не было, 502 остаётся для случая,
-    # когда yt-dlp вообще не смог получить метаданные.
+    # Метаданные без duration — 400 video_unreadable (нельзя подтвердить
+    # лимит длительности), а не 502 download_failed: сетевого сбоя не было,
+    # 502 остаётся для случая, когда метаданные получить не удалось.
     monkeypatch.setattr(downloader, "_assert_public_host", lambda hostname: None)
     monkeypatch.setattr(downloader, "_yt_dlp_metadata", lambda url: {"id": "abc123"})
     with pytest.raises(downloader.VideoUnreadableError) as exc_info:
@@ -320,9 +320,8 @@ def test_probe_duration_without_platform_duration_is_client_error(monkeypatch):
 
 
 def test_probe_duration_garbage_value_is_client_error(monkeypatch):
-    # Регрессия: мусор вместо числа длительности раньше превращался в
-    # необработанный ValueError (500 internal_error); данные платформы
-    # недостоверны — это 400 video_unreadable, как и для локального файла.
+    # Мусор вместо числа длительности — 400 video_unreadable (данные
+    # платформы недостоверны), а не необработанный ValueError.
     monkeypatch.setattr(downloader, "_assert_public_host", lambda hostname: None)
     monkeypatch.setattr(downloader, "_yt_dlp_metadata", lambda url: {"duration": "abc"})
     with pytest.raises(downloader.VideoUnreadableError, match="недостоверную длительность"):
@@ -330,9 +329,9 @@ def test_probe_duration_garbage_value_is_client_error(monkeypatch):
 
 
 def test_missing_cookies_file_fails_fast(tmp_path):
-    # Регрессия: yt-dlp при отсутствующем/нечитаемом cookiefile падает сырым
-    # Python-traceback (yt_dlp/cookies.py), а не чистой ошибкой; проверяем файл
-    # до вызова yt-dlp и отдаём понятную подсказку про монтирование.
+    # yt-dlp при отсутствующем/нечитаемом cookiefile падает сырым
+    # Python-traceback (yt_dlp/cookies.py) — файл проверяется до вызова
+    # yt-dlp, ответ содержит понятную подсказку про монтирование.
     missing = tmp_path / "absent.txt"
     downloader.YTDLP_COOKIES_FILE = str(missing)
     try:
@@ -355,9 +354,8 @@ def test_missing_cookies_file_fails_fast(tmp_path):
 
 
 def test_broken_cookies_files_fail_fast(tmp_path):
-    # Регрессия: сломанный cookiefile ломает yt-dlp на разных этапах, и в
-    # ответе API это выглядело необъяснимым сбоем или сырым traceback.
-    # Проверяем заранее: каталог вместо файла (Docker создаёт КАТАЛОГ при
+    # Сломанный cookiefile ломает yt-dlp на разных этапах — проверяем
+    # заранее: каталог вместо файла (Docker создаёт КАТАЛОГ при
     # раскомментированном монтировании и отсутствии файла на хосте), пустой
     # файл (New-Item), JSON-экспорт вместо Netscape и UTF-16 из PowerShell.
     dir_case = tmp_path / "cookies.txt"
@@ -386,26 +384,42 @@ def test_broken_cookies_files_fail_fast(tmp_path):
         downloader.YTDLP_COOKIES_FILE = original
 
 
-@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
-                    reason="root игнорирует права доступа к файлам")
-def test_readonly_cookies_file_fails_fast(tmp_path):
-    # Регрессия: yt-dlp 2026.10.26 перезаписывает файл cookies при каждом
-    # запуске (close() → save_cookies() → cookiejar.save()), ДАЖЕ когда
-    # извлечение упало. Монтирование «:ro» или docker secrets (/run/secrets)
-    # роняет запуск в самом конце с сырым traceback «PermissionError: [Errno 13]»
-    # ПОСЛЕ настоящего сообщения об ошибке. Проверяем право записи заранее.
-    ro = tmp_path / "cookies.txt"
-    ro.write_text(
+def test_private_cookies_copy_isolated_per_run(tmp_path, monkeypatch):
+    # yt-dlp перезаписывает cookiefile при каждом запуске (close() →
+    # save_cookies()), поэтому несколько одновременных запросов с одним
+    # YTDLP_COOKIES_FILE писали бы в один файл — гонка и порча. Каждому
+    # запуску выдаётся личная копия: в команду уходит путь копии, исходник
+    # не пишется (поэтому работают и «:ro»-монтирования, и docker secrets),
+    # копия удаляется после запуска.
+    source = tmp_path / "cookies.txt"
+    source.write_text(
         "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tA\tB\n",
         encoding="utf-8",
     )
-    ro.chmod(0o444)
+    source.chmod(0o444)  # только чтение: исходник никто не перезаписывает
     original = downloader.YTDLP_COOKIES_FILE
+    downloader.YTDLP_COOKIES_FILE = str(source)
     try:
-        downloader.YTDLP_COOKIES_FILE = str(ro)
-        with pytest.raises(downloader.DownloadError) as exc_info:
-            downloader._assert_cookies_readable()
-        assert ":ro" in str(exc_info.value)
+        # Право записи больше не проверяется: «:ro» не препятствие.
+        downloader._assert_cookies_readable()
+
+        monkeypatch.setattr(downloader, "_assert_public_host", lambda hostname: None)
+        captured = {}
+
+        def fake_run(command, timeout):
+            captured["command"] = list(command)
+            copy = Path(command[command.index("--cookies") + 1])
+            captured["copy_content"] = copy.read_text(encoding="utf-8")  # копия жива во время запуска
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="{}", stderr="")
+
+        monkeypatch.setattr(downloader, "_run", fake_run)
+        downloader._yt_dlp_metadata("https://www.youtube.com/watch?v=abc123")
+        i = captured["command"].index("--cookies")
+        used = Path(captured["command"][i + 1])
+        assert used != source  # в команду идёт копия, а не общий файл
+        assert captured["copy_content"].startswith("# Netscape")  # содержимое скопировано
+        assert not used.exists()  # копия удалена после запуска
+        assert source.read_text(encoding="utf-8").startswith("# Netscape")  # исходник не тронут
     finally:
         downloader.YTDLP_COOKIES_FILE = original
-        ro.chmod(0o644)
+        source.chmod(0o644)

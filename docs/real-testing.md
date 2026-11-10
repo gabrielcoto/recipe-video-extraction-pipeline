@@ -35,7 +35,11 @@
 .venv/bin/python scripts/compare_gold.py --validate-only data/expected_outputs/*.json
 ```
 
-4. Зафиксируй нормализацию **до** прогонов: регистр и пробелы, единицы, обработка неизвестных значений. Рекомендуемый пресет для `compare_gold.py`: `--exclude /source --absent-equals-null`; выбор запиши в `data/input_videos/provenance.md` вместе с автором видео, датой получения и автором разметки. После прогона нормализацию не менять.
+4. Зафиксируй нормализацию **до** прогонов: регистр и пробелы, единицы, обработка неизвестных значений. Рекомендуемый пресет для `compare_gold.py`: `--exclude /source --absent-equals-null --skip-notes --skip-instructions`; выбор запиши в `data/input_videos/provenance.md` вместе с автором видео, датой получения и автором разметки.
+
+   Флаги `--skip-notes` и `--skip-instructions` выводят из количественной метрики единственные поля свободной формы — `note` ингредиентов и тексты шагов. Произвольные уточнения видео («без горки», «через сито») и перефразированные инструкции нормированной записи не имеют; точное совпадение строк наказывало бы формулировку, а не ошибку извлечения. Качество шагов это не отменяет: каждый прогон дополнительно оценивается вручную против видео, вердикт фиксируется в `provenance.md` («Шаги: N/N по существу верны, формулировки различаются; отклонения: …»).
+
+   Ингредиенты сравнитель сопоставляет по имени, а не по позиции списка: пропущенный или лишний ингредиент стоит ровно своих полей и не сдвигает пары остальных. Измеряемая часть прежняя: `quantity.value`, `quantity.unit`, длительности шагов, `title`, `servings`; допустимость единиц (`unit` в пределах enum 1.0.0) страхует валидация контрактом. Нормализация фиксируется до прогонов, применяется ко всем видео набора одинаково и после прогона не меняется.
 
 ## Протокол прогона (для каждого видео)
 
@@ -46,10 +50,9 @@
 .venv/bin/python -m src.main --file data/input_videos/tomatoChickpea.mp4 \
   > runs/tomatoChickpea.file.json
 
-# 2. API, локальный файл
+# 2. API, локальный файл (обёртка проверяет файл до curl — без неё пропажа файла выглядит как «curl: (26)»)
 make run
-curl -s -X POST http://localhost:8000/extract/upload \
-  -F 'file=@data/input_videos/tomatoChickpea.mp4' \
+scripts/upload.sh data/input_videos/tomatoChickpea.mp4 \
   > runs/tomatoChickpea.upload.json
 
 # 3. URL (если видео доступно на согласованной платформе)
@@ -58,8 +61,9 @@ curl -s -X POST http://localhost:8000/extract \
   -d '{"url": "https://..."}' \
   > runs/tomatoChickpea.url.json
 
-# 4. Сравнение с эталоном
+# 4. Сравнение с эталоном (пресет п. 4)
 .venv/bin/python scripts/compare_gold.py --exclude /source --absent-equals-null \
+  --skip-notes --skip-instructions \
   data/expected_outputs/tomatoChickpea.json runs/tomatoChickpea.file.json
 ```
 

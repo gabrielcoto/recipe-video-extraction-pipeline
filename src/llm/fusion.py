@@ -123,9 +123,15 @@ def _call_llm(messages: list[dict]) -> str:
         raise LLMUnavailableError(f"LLM-сервис вернул HTTP {response.status_code}")
     try:
         payload = response.json()
-        return payload["choices"][0]["message"]["content"]
+        content = payload["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         raise LLMUnavailableError("LLM-сервис вернул некорректный ответ") from exc
+    if not isinstance(content, str):
+        # content: null (refusal части провайдеров) — невалидный ответ:
+        # пустая строка не пройдёт проверку JSON/схемы — повтор и
+        # 502 llm_invalid_response после исчерпания попыток.
+        return ""
+    return content
 
 
 def fuse_recipe(transcript: str, screen_text: str, source: Source) -> Recipe:
@@ -152,9 +158,12 @@ def fuse_recipe(transcript: str, screen_text: str, source: Source) -> Recipe:
                 return Recipe.model_validate({**data, "source": source})
             except ValidationError as exc:
                 last_error = f"нарушение схемы: {exc.errors(include_url=False)[:3]}"
-        # Модель должна видеть свой предыдущий ответ, иначе при температуре 0
-        # попытка почти совпадает с предыдущей.
-        messages.append({"role": "assistant", "content": raw})
+        # Без своего предыдущего ответа в сообщениях повтор при температуре 0
+        # повторит ту же ошибку. Пустой ответ assistant-сообщение не получает:
+        # часть провайдеров отклоняет пустой content ассистента с 400 —
+        # повтор ушёл бы как llm_unavailable вместо llm_invalid_response.
+        if raw.strip():
+            messages.append({"role": "assistant", "content": raw})
         messages.append({
             "role": "user",
             "content": f"Предыдущий ответ не прошёл проверку: {last_error}. "

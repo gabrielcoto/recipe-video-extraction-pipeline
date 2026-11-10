@@ -64,10 +64,10 @@ services:
       # YouTube cookies (bot check): put cookies.txt next to this file,
       # uncomment the mount and set YTDLP_COOKIES_FILE=/cookies.txt in .env.
       # Cookies are account credentials — keep the file out of git.
-      # NOTE: mount WITHOUT ":ro" — yt-dlp rewrites the file on every run
-      # (close() → save_cookies()), even when extraction failed; with a
-      # read-only mount the run ends with a raw PermissionError traceback.
-      - ./cookies.txt:/cookies.txt
+      # ":ro" is fine (docker secrets too): yt-dlp gets a private temp copy
+      # per run (_private_cookies_file); the mounted file is only ever read.
+      # Update cookies by replacing the file — no container restart needed.
+      # - ./cookies.txt:/cookies.txt
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
       interval: 10s

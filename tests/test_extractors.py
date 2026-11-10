@@ -3,6 +3,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from src.extractors import frames as frames_mod
 from src.extractors import ocr as ocr_mod
 from src.extractors import stt as stt_mod
 from src.llm import fusion
-from src.errors import MediaProcessingError
+from src.errors import MediaProcessingError, ModelUnavailableError
 from src.config import WHISPER_LANGUAGE
 from src.models import UploadSource
 
@@ -100,10 +101,9 @@ def test_ocr_confidence_threshold_drops_weak_lines(monkeypatch):
 
 
 def test_ocr_wrapper_disables_mkldnn_on_every_predictor():
-    # Регрессия: Paddle 3.x включает oneDNN для CPU по умолчанию
-    # (Config().mkldnn_enabled() == True), а PaddleOCR 2.x при enable_mkldnn=False
-    # не вызывает disable_mkldnn() — на части CPU и в эмуляции это даёт
-    # «could not create a primitive descriptor for a reorder primitive».
+    # Paddle 3.x включает oneDNN для CPU по умолчанию, а PaddleOCR 2.x при
+    # enable_mkldnn=False не вызывает disable_mkldnn() — обёртка обязательна,
+    # иначе на части CPU и в эмуляции падает создание предиктора.
     # Обёртка create_predictor обязана выключать oneDNN для каждого предсказателя.
     calls: list[str] = []
 
@@ -172,9 +172,8 @@ def test_fusion_rejects_empty_inputs():
 
 
 def test_fusion_prompt_language_follows_video_by_default(monkeypatch):
-    # Регрессия: раньше промпт жёстко требовал русский ответ («Язык ответа — русский»),
-    # и никакая переменная окружения на это не влияла. По умолчанию (auto) язык
-    # рецепта определяется языком исходного видео.
+    # Язык рецепта по умолчанию (auto) определяется языком исходного видео:
+    # жёсткого «Язык ответа — русский» в промпте быть не должно.
     monkeypatch.setattr(fusion, "OUTPUT_LANGUAGE", "auto")
     received: dict = {}
 
@@ -221,8 +220,8 @@ def test_fusion_prompt_keeps_units_within_contract_1_0_0():
 
 
 def test_fusion_prompt_requires_minor_ingredients_and_note_fallback():
-    # Регрессия: на плотной выдаче OCR (MAX_FRAMES=24) модель пропускала мелкие
-    # позиции вроде соли; единицы вне списка теряли количество целиком.
+    # Промпт обязан требовать все надписи, включая мелкие позиции вроде соли,
+    # и ограничивать единицы списком контракта.
     prompt = fusion._system_prompt()
     assert "соль" in prompt
     assert "каждый ингредиент" in prompt
@@ -231,7 +230,7 @@ def test_fusion_prompt_requires_minor_ingredients_and_note_fallback():
 
 
 def test_fusion_sends_configured_temperature(monkeypatch):
-    # Регрессия: температура была жёстко 0.0 в теле запроса — настроить её было нельзя.
+    # Температура запроса читается из конфига, а не жёстко 0.0.
     received: dict = {}
 
     class FakeResponse:
@@ -312,10 +311,9 @@ def _fake_llm_client(monkeypatch, behaviors):
 
 
 def test_fusion_retries_transient_network_error(monkeypatch):
-    # Регрессия: сетевой сбой (обрыв соединения, таймаут) раньше вызывал
-    # LLMUnavailableError сразу, и один сбой провайдера срывал всю загрузку.
-    # Транзиторные сетевые сбои повторяются отдельно от повторов схемы
-    # (LLM_MAX_RETRIES покрывает только невалидный JSON/нарушение схемы).
+    # Сетевые сбои (обрыв соединения, таймаут) повторяются отдельно от
+    # повторов схемы: LLM_MAX_RETRIES покрывает только невалидный JSON или
+    # нарушение схемы, один сбой провайдера не должен срывать загрузку.
     calls = _fake_llm_client(monkeypatch, [httpx.ConnectError("connection reset"), 200])
     monkeypatch.setattr(fusion, "LLM_NETWORK_RETRIES", 1)
     recipe = fusion.fuse_recipe("взбейте два яйца", "яйца 2 шт", UploadSource(type="upload"))
@@ -353,6 +351,170 @@ def test_fusion_network_retry_exhaustion_is_bounded(monkeypatch):
     assert calls["calls"] == 3  # 1 исходная попытка + 2 повтора
 
 
+def test_fusion_null_content_is_invalid_response_not_500(monkeypatch):
+    # content: null (refusal части провайдеров) — невалидный ответ, а не
+    # повод для 500: попытка повторяется, после исчерпания LLM_MAX_RETRIES —
+    # 502 llm_invalid_response.
+    state = {"calls": 0}
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": None}}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):  # noqa: ARG002 - форма вызова httpx
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, *args, **kwargs):
+            state["calls"] += 1
+            return FakeResponse()
+
+    monkeypatch.setattr(fusion.httpx, "Client", FakeClient)
+    monkeypatch.setattr(fusion, "LLM_API_KEY", "key")
+    monkeypatch.setattr(fusion, "LLM_BASE_URL", "https://llm.example")
+    monkeypatch.setattr(fusion, "LLM_MODEL", "test-model")
+    monkeypatch.setattr(fusion, "LLM_MAX_RETRIES", 1)
+    monkeypatch.setattr(fusion, "sleep", lambda seconds: None)
+    with pytest.raises(fusion.LLMInvalidResponseError) as exc_info:
+        fusion.fuse_recipe("текст", "текст", UploadSource(type="upload"))
+    assert exc_info.value.http_status == 502
+    assert exc_info.value.code == "llm_invalid_response"
+    assert state["calls"] == 2  # повтор состоялся, а не разовый 500
+
+
+def test_fusion_retry_after_empty_content_skips_empty_assistant_message(monkeypatch):
+    # Пустой ответ не добавляет assistant-сообщение с пустым content:
+    # часть провайдеров отклоняет его с 400 — повтор ушёл бы как
+    # llm_unavailable вместо llm_invalid_response. Исправляющая
+    # подсказка уходит обычным user-сообщением.
+    bodies = []
+    state = {"calls": 0}
+
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self, content):
+            self._content = content
+
+        def json(self):
+            return {"choices": [{"message": {"content": self._content}}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):  # noqa: ARG002 - форма вызова httpx
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, headers=None, json=None):  # noqa: A002 - параметр httpx
+            bodies.append(json["messages"])
+            state["calls"] += 1
+            content = None if state["calls"] == 1 else json_mod.dumps(_valid_payload())
+            return FakeResponse(content)
+
+    json_mod = json
+    monkeypatch.setattr(fusion.httpx, "Client", FakeClient)
+    monkeypatch.setattr(fusion, "LLM_API_KEY", "key")
+    monkeypatch.setattr(fusion, "LLM_BASE_URL", "https://llm.example")
+    monkeypatch.setattr(fusion, "LLM_MODEL", "test-model")
+    monkeypatch.setattr(fusion, "sleep", lambda seconds: None)
+    recipe = fusion.fuse_recipe("текст", "текст", UploadSource(type="upload"))
+    assert recipe.title == "Омлет"
+    assert state["calls"] == 2
+    retry_messages = bodies[1]
+    assert not any(
+        m["role"] == "assistant" and not m["content"].strip()
+        for m in retry_messages
+    )
+    assert retry_messages[-1]["role"] == "user"  # повтор уходит user-сообщением
+
+
+def test_models_load_once_under_concurrent_requests(monkeypatch):
+    # Обработчики FastAPI синхронные и исполняются в threadpool: без
+    # блокировки два одновременных первых запроса загружали бы Whisper
+    # и PaddleOCR каждый по разу (двойная память и минуты простоя).
+    from concurrent.futures import ThreadPoolExecutor
+    from time import sleep
+
+    def load_once(module, getter, global_name, stub_module, stub_attr):
+        calls = []
+
+        class Heavy:
+            def __init__(self, *args, **kwargs):
+                calls.append(1)
+                sleep(0.05)  # окно, в которое без блокировки вошёл бы второй поток
+
+        stub = types.ModuleType(stub_module)
+        setattr(stub, stub_attr, Heavy)
+        monkeypatch.setitem(sys.modules, stub_module, stub)
+        monkeypatch.setattr(module, global_name, None)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda _: getattr(module, getter)(), range(4)))
+        assert len(calls) == 1  # модель загружена ровно один раз
+
+    load_once(stt_mod, "_get_model", "_MODEL", "faster_whisper", "WhisperModel")
+    load_once(ocr_mod, "_get_reader", "_READER", "paddleocr", "PaddleOCR")
+
+
+def test_whisper_load_failure_is_model_unavailable(monkeypatch):
+    # Сбой конструктора WhisperModel — проблема окружения, а не входа:
+    # 503 model_unavailable, как у OCR при сбое инициализации.
+    stub = types.ModuleType("faster_whisper")
+
+    class Offline:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("offline run, no cached model")
+
+    stub.WhisperModel = Offline
+    monkeypatch.setitem(sys.modules, "faster_whisper", stub)
+    monkeypatch.setattr(stt_mod, "_MODEL", None)
+    with pytest.raises(ModelUnavailableError, match="Не удалось загрузить STT-модель"):
+        stt_mod._get_model()
+
+
+def test_ocr_inference_is_serialized_across_threads(monkeypatch):
+    # Блокировка _READER_LOCK защищает только создание reader'а; предиктор
+    # Paddle не потокобезопасен и в инференсе, а reader один на все запросы.
+    # Параллельные .ocr() одного экземпляра сериализуются _INFER_LOCK.
+    from concurrent.futures import ThreadPoolExecutor
+    from time import sleep
+
+    class FakeReader:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.current = 0
+            self.max_seen = 0
+
+        def ocr(self, path, cls=True):  # noqa: ARG002 - форма вызова PaddleOCR
+            with self._lock:
+                self.current += 1
+                self.max_seen = max(self.max_seen, self.current)
+            sleep(0.05)  # окно, в которое без блокировки вошли бы остальные потоки
+            with self._lock:
+                self.current -= 1
+            return [[[None, ("яйца", 0.9)]]]
+
+    reader = FakeReader()
+    monkeypatch.setattr(ocr_mod, "_READER", reader)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(
+            lambda _: ocr_mod.recognize_text([Path("frame.jpg")]), range(4)
+        ))
+    assert results == ["яйца"] * 4  # распознавание не исказилось
+    assert reader.max_seen == 1  # конкурентных вызовов .ocr() не было
+
+
 def _render_video(tmp_path: Path, name: str, with_audio: bool) -> Path:
     """Реальный MP4 через lavfi: с звуковой дорожкой (sine) или без неё (-an)."""
     command = ["ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=320x240:rate=10"]
@@ -368,17 +530,15 @@ def _render_video(tmp_path: Path, name: str, with_audio: bool) -> Path:
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="нужен ffmpeg")
 def test_run_media_raises_on_ffmpeg_failure(tmp_path):
-    # Регрессия: run_media использовал check=False и пропускал неуспешный
-    # код возврата, из-за чего вызывающий код падал на несозданных файлах.
+    # run_media проверяет код возврата: неуспешный ffmpeg не проходит молча.
     with pytest.raises(RuntimeError, match="ffmpeg"):
         media.run_media(["ffmpeg", "-y", "-i", str(tmp_path / "missing.mp4"), str(tmp_path / "out.mp4")])
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="нужен ffmpeg")
 def test_transcribe_returns_empty_for_video_without_audio(monkeypatch, tmp_path):
-    # Регрессия: у видео без аудиодорожки ffmpeg-извлечение звука падает,
-    # старый код шёл дальше и читал несозданный wav. Теперь — пустая расшифровка,
-    # и рецепт собирается по OCR; STT-модель не нужна.
+    # Видео без аудиодорожки — пустая расшифровка, рецепт собирается по
+    # OCR; STT-модель не нужна.
     video = _render_video(tmp_path, "muted.mp4", with_audio=False)
     monkeypatch.setattr(
         stt_mod,
@@ -410,9 +570,8 @@ def test_transcribe_hands_extracted_wav_to_model(monkeypatch, tmp_path):
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="нужен ffmpeg")
 def test_transcribe_auto_language_passes_none_to_whisper(monkeypatch, tmp_path):
-    # WHISPER_LANGUAGE=auto — автодетект языка речи faster-whisper: в
-    # transcribe уходит language=None. Раньше строка конфига уходила как
-    # есть, и "auto" ловил ошибку валидации языка вместо автодетекта.
+    # WHISPER_LANGUAGE=auto — автодетект языка речи faster-whisper:
+    # в transcribe уходит language=None, а не строка "auto".
     video = _render_video(tmp_path, "voiced-auto.mp4", with_audio=True)
     received: dict = {}
 
@@ -436,8 +595,7 @@ def test_transcribe_reports_unreadable_file(tmp_path):
 
 
 def test_stt_uses_configured_model_settings(monkeypatch):
-    # Регрессия: compute_type был жёстко "int8" — задать float16 на GPU или
-    # float32 было невозможно; теперь все три параметра модели читаются из конфига.
+    # Модель, устройство и compute_type читаются из конфига, а не жёстко в коде.
     calls: dict = {}
 
     class FakeWhisperModel:
@@ -459,7 +617,6 @@ def test_stt_uses_configured_model_settings(monkeypatch):
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="нужен ffmpeg")
 def test_extract_frames_reports_ffmpeg_failure(tmp_path):
-    # Регрессия: сбой ffmpeg при нарезке кадров раньше проходил молча
-    # и выглядел как «ffmpeg не вернул ни одного кадра».
+    # Сбой ffmpeg при нарезке кадров не проходит молча.
     with pytest.raises(MediaProcessingError):
         frames_mod.extract_frames(tmp_path / "missing.mp4", tmp_path / "frames")

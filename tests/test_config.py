@@ -5,8 +5,7 @@ import src.config as config
 
 
 def test_tuning_settings_read_from_env(monkeypatch):
-    # Регрессия: MAX_VIDEO_SECONDS, MAX_UPLOAD_BYTES, WHISPER_COMPUTE_TYPE и
-    # LLM_TEMPERATURE раньше были жёстко заданы в коде и не настраивались.
+    # Лимиты и параметры настраиваются переменными окружения, а не константами.
     monkeypatch.setenv("MAX_VIDEO_SECONDS", "600")
     monkeypatch.setenv("MAX_UPLOAD_BYTES", "2048")
     monkeypatch.setenv("WHISPER_COMPUTE_TYPE", "float16")

@@ -9,8 +9,11 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -26,7 +29,7 @@ from src.config import (
     YTDLP_JS_RUNTIME,
     YTDLP_PLAYER_CLIENT,
 )
-from src.errors import AppError, MediaProcessingError, VideoUnreadableError
+from src.errors import AppError, DownloaderUnavailableError, MediaProcessingError, VideoUnreadableError
 
 
 class DownloadError(AppError):
@@ -49,8 +52,35 @@ def _run(command: list[str], timeout: int) -> subprocess.CompletedProcess:
         return subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
         raise DownloadError(f"Команда {command[0]!r} превысила лимит времени {timeout} с") from exc
+    except FileNotFoundError as exc:
+        # Отсутствующий бинарник — проблема окружения сервера, а не входа:
+        # 500 downloader_unavailable, а не 502 download_failed. Симметрично
+        # с ffprobe (ToolNotFoundError → media_processing_failed).
+        raise DownloaderUnavailableError(
+            f"Исполняемый файл {command[0]!r} не найден; установите yt-dlp"
+        ) from exc
     except OSError as exc:
         raise DownloadError(f"Не удалось запустить {command[0]!r}: {exc}") from exc
+
+
+@contextmanager
+def _private_cookies_file():
+    # yt-dlp перезаписывает cookiefile при каждом запуске: общий файл при
+    # конкурентных запросах портился бы. Каждому запуску — личная копия;
+    # исходник только читается («:ro» и docker secrets работают), копия
+    # удаляется после запуска.
+    if not YTDLP_COOKIES_FILE:
+        yield None
+        return
+    handle = tempfile.NamedTemporaryFile(prefix="fropti-cookies-", suffix=".txt", delete=False)
+    handle.close()
+    try:
+        # copyfile, а не copy2: права исходника (например «:ro») не
+        # переносятся — копия должна быть доступна yt-dlp на запись.
+        shutil.copyfile(YTDLP_COOKIES_FILE, handle.name)
+        yield handle.name
+    finally:
+        Path(handle.name).unlink(missing_ok=True)
 
 
 # Первая строка Netscape cookies.txt должна содержать «# Netscape HTTP Cookie
@@ -59,15 +89,10 @@ _NETSCAPE_MAGIC = re.compile(r"#( Netscape)? HTTP Cookie File", re.IGNORECASE)
 
 
 def _assert_cookies_readable() -> None:
-    # Сломанный cookiefile роняет yt-dlp по-разному, а в API это выглядит как
-    # необъяснимый сбой, поэтому всё проверяем заранее:
-    #   1) каталог вместо файла — Docker при раскомментированном монтировании
-    #      и отсутствии файла на хосте создаёт пустый каталог;
-    #   2) файл отсутствует или нечитаем — cookies молча не работают;
-    #   3) не Netscape-формат (пустой, JSON-экспорт, UTF-16) — невнятный
-    #      LoadError/UnicodeDecodeError;
-    #   4) только чтение («:ro», docker secrets) — yt-dlp перезаписывает файл
-    #      при выходе даже после неудачного извлечения → PermissionError.
+    # Сломанный cookiefile роняет yt-dlp невнятным traceback'ом — проверяем
+    # заранее: каталог вместо файла (пустое монтирование Docker), нечитаемый
+    # файл, не-Netscape формат. Право записи не проверяется: исходник никто
+    # не пишет (см. _private_cookies_file).
     if not YTDLP_COOKIES_FILE:
         return
     path = Path(YTDLP_COOKIES_FILE)
@@ -107,13 +132,6 @@ def _assert_cookies_readable() -> None:
             "причины: файл пуст, создан вручную (New-Item) или экспортирован в JSON. "
             "Нужен экспорт расширением «Get cookies.txt LOCALLY» в Netscape-формате."
         )
-    if not os.access(YTDLP_COOKIES_FILE, os.W_OK):
-        raise DownloadError(
-            f"Файл cookies доступен только для чтения: {YTDLP_COOKIES_FILE!r}. yt-dlp "
-            "перезаписывает файл при каждом запуске, поэтому монтирование с флагом «:ro» "
-            "(как и /run/secrets) роняет запуск с traceback «PermissionError» в самом "
-            "конце. Смонтируйте файл БЕЗ «:ro»: ./cookies.txt:/cookies.txt."
-        )
 
 
 def _hostname(url: str) -> str:
@@ -131,11 +149,9 @@ def _assert_host_allowed(hostname: str) -> None:
 
 
 def _assert_public_host(hostname: str) -> None:
-    # DNS разрешается здесь один раз, а yt-dlp при скачивании пере-разрешит
-    # хост сам: злонамеренный DNS может вернуть разным запросам разные адреса
-    # (класс «DNS-rebinding race»). Для MVP принято: хосты ограничены
-    # allowlist'ом, полное закрытие требует сетевого контроля исходящих
-    # соединений. Туда же относится окно редиректов yt-dlp — docs/architecture.md.
+    # DNS разрешается один раз, yt-dlp при скачивании пере-разрешит сам:
+    # окно DNS-rebinding. Для MVP принято, закрытие требует контроля egress —
+    # docs/architecture.md, раздел «Безопасность».
     try:
         infos = socket.getaddrinfo(hostname, None)
     except socket.gaierror as exc:
@@ -154,9 +170,8 @@ def _assert_public_host(hostname: str) -> None:
 
 
 def _stderr_excerpt(stderr: str, limit: int = 400) -> str:
-    # WARNING'и yt-dlp печатает до финального ERROR, поэтому показываем конец
-    # потока ошибок; сырой Python-traceback расширяет лимит — хвост traceback
-    # без последней строки-исключения бесполезен для диагноза.
+    # WARNING печатаются до финального ERROR — показываем конец потока;
+    # traceback расширяет лимит, хвост без последней строки бесполезен.
     text = stderr.strip()
     if "Traceback (most recent call last)" in text:
         limit = 3000
@@ -165,17 +180,16 @@ def _stderr_excerpt(stderr: str, limit: int = 400) -> str:
     return text[-limit:]
 
 
-def _yt_dlp_command(*extra: str) -> list[str]:
-    # YouTube с 2025 отдаёт плеер с challenge-скриптами: yt-dlp исполняет их в
-    # JS-рантайме (node/deno/bun), без флага ищется только deno — извлечение
-    # падает (см. YTDLP_JS_RUNTIME). Cookies и смена клиента плеера — против
-    # проверки «Sign in to confirm you're not a bot»; оба вызова yt-dlp
-    # получают их одинаково, проверка срабатывает уже на метаданных (-J).
+def _yt_dlp_command(*extra: str, cookies_file: str | None = None) -> list[str]:
+    # yt-dlp исполняет challenge YouTube в JS-рантайме (см. YTDLP_JS_RUNTIME);
+    # cookies и клиент плеера — против «Sign in to confirm you're not a bot»,
+    # проверка срабатывает уже на метаданных (-J). cookies_file — личная копия
+    # (_private_cookies_file): yt-dlp перезаписывает cookiefile при выходе.
     command = ["yt-dlp", "--no-playlist"]
     if YTDLP_JS_RUNTIME:
         command += ["--js-runtimes", YTDLP_JS_RUNTIME]
-    if YTDLP_COOKIES_FILE:
-        command += ["--cookies", YTDLP_COOKIES_FILE]
+    if cookies_file:
+        command += ["--cookies", cookies_file]
     if YTDLP_COOKIES_FROM_BROWSER:
         command += ["--cookies-from-browser", YTDLP_COOKIES_FROM_BROWSER]
     if YTDLP_PLAYER_CLIENT:
@@ -192,7 +206,11 @@ def _yt_dlp_command(*extra: str) -> list[str]:
 
 
 def _yt_dlp_metadata(url: str) -> dict:
-    result = _run(_yt_dlp_command("--skip-download", "-J", url), DOWNLOAD_TIMEOUT_SECONDS)
+    with _private_cookies_file() as cookies:
+        result = _run(
+            _yt_dlp_command("--skip-download", "-J", url, cookies_file=cookies),
+            DOWNLOAD_TIMEOUT_SECONDS,
+        )
     if result.returncode != 0:
         raise DownloadError(f"yt-dlp не получил метаданные: {_stderr_excerpt(result.stderr)}")
     try:
@@ -233,15 +251,10 @@ def probe_duration(source: str | Path) -> float:
         raise VideoUnreadableError(f"Платформа сообщила недостоверную длительность: {duration!r}") from exc
 
 
-# Потолок 720p — предпочтительный, не жёсткий (PaddleOCR на 144–360p почти
-# слеп): height-фильтр стоит не во всех ветках, хвост цепочки срабатывает,
-# только когда у источника нет вариантов ≤720p вовсе — 1080p лучше провала
-# загрузки, а размер всё равно ограничивает --max-filesize. На YouTube
-# варианты ≤720p есть всегда, там потолок фактический.
-# bv*+ba — дефолтная пара yt-dlp: у YouTube комбинированный файл обычно один
-# и на 360p, а video-only есть до 1080p; b-ветки нужны источникам без отдельных
-# аудиодорожек (ba отбирает только audio-only). worst — последний запас,
-# --max-filesize считается на каждый файл до склейки.
+# Потолок 720p — предпочтительный, не жёсткий: PaddleOCR на 144–360p почти
+# слеп, height-фильтр стоит не во всех ветках, 1080p лучше провала загрузки
+# (--max-filesize ограничивает размер). bv*+ba — дефолтная пара yt-dlp,
+# b-ветки нужны источникам без отдельных аудиодорожек; worst — запас.
 _FORMAT_SELECTOR = (
     "bv*[height<=720][ext=mp4]+ba/bv*[height<=720]+ba"
     "/b[height<=720][ext=mp4]/b[height<=720]"
@@ -251,26 +264,26 @@ _FORMAT_SELECTOR = (
 
 def download_video(url: str, output_dir: Path) -> Path:
     # Второй вызов yt-dlp для той же страницы: лимит длительности обязан
-    # срабатывать до скачивания, а подавать метаданные проверки назад через
-    # --load-info-json рискованно — прямые ссылки на медиа живут минуты и к
-    # моменту скачивания протухнут. Повторное извлечение стоит секунды на
-    # фоне STT/OCR, измеряемых минутами.
+    # срабатывать до скачивания, а --load-info-json ненадёжен — прямые
+    # ссылки на медиа живут минуты. Повторное извлечение стоит секунды.
     hostname = _hostname(url)
     _assert_host_allowed(hostname)
     _assert_public_host(hostname)
     _assert_cookies_readable()
     output_dir.mkdir(parents=True, exist_ok=True)
     template = str(output_dir / "source.%(ext)s")
-    result = _run(
-        _yt_dlp_command(
-            "--restrict-filenames",
-            "--max-filesize", str(MAX_DOWNLOAD_BYTES),
-            "-f", _FORMAT_SELECTOR,
-            "-o", template,
-            url,
-        ),
-        DOWNLOAD_TIMEOUT_SECONDS * 4,
-    )
+    with _private_cookies_file() as cookies:
+        result = _run(
+            _yt_dlp_command(
+                "--restrict-filenames",
+                "--max-filesize", str(MAX_DOWNLOAD_BYTES),
+                "-f", _FORMAT_SELECTOR,
+                "-o", template,
+                url,
+                cookies_file=cookies,
+            ),
+            DOWNLOAD_TIMEOUT_SECONDS * 4,
+        )
     if result.returncode != 0:
         raise DownloadError(f"Не удалось скачать видео: {_stderr_excerpt(result.stderr)}")
     candidates = sorted(output_dir.glob("source.*"))

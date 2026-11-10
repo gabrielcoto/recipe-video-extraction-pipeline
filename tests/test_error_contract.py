@@ -69,3 +69,36 @@ def test_missing_ffprobe_is_a_server_error_not_unreadable_video(monkeypatch):
         downloader.probe_duration(Path("/tmp/does-not-matter.mp4"))
     assert info.value.http_status == 500
     assert info.value.code == "media_processing_failed"
+
+
+def test_missing_yt_dlp_binary_is_server_error_not_download_failure(monkeypatch):
+    # Отсутствующий бинарь yt-dlp — проблема окружения сервера, как и
+    # отсутствие ffprobe: 500 downloader_unavailable, а не 502 download_failed.
+    def no_binary(command, **kwargs):
+        raise FileNotFoundError(f"[Errno 2] No such file or directory: {command[0]!r}")
+
+    monkeypatch.setattr(downloader.subprocess, "run", no_binary)
+    monkeypatch.setattr(downloader, "_assert_public_host", lambda hostname: None)
+    with pytest.raises(downloader.DownloaderUnavailableError) as exc_info:
+        downloader.probe_duration("https://www.youtube.com/watch?v=abc")
+    assert exc_info.value.http_status == 500
+    assert exc_info.value.code == "downloader_unavailable"
+
+
+def test_upload_rejects_oversized_content_length_before_body():
+    # Честный клиент с большим Content-Length получал 413 только после полной
+    # выгрузки тела (UploadFile.size заполняется при разборе multipart).
+    # Middleware отклоняет запрос до чтения тела; порог берётся с запасом на
+    # заголовки multipart, точную границу по файлу проверяет file.size,
+    # chunked-запросы без Content-Length — тоже она.
+    limit = api.MAX_UPLOAD_BYTES + api._UPLOAD_REJECT_MARGIN_BYTES + 1
+    limit_mib = api.MAX_UPLOAD_BYTES / (1024 * 1024)
+    response = client.post(
+        "/extract/upload",
+        content=b"tiny",
+        headers={"Content-Length": str(limit)},
+    )
+    assert response.status_code == 413
+    detail = response.json()["detail"]
+    assert detail["code"] == "file_too_large"
+    assert f"{limit_mib:g}" in detail["message"]

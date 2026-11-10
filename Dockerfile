@@ -6,12 +6,10 @@
 # Full image:   ~5-6 GB, builds in ~15-20 min. Pre-downloads Whisper + both PaddleOCR
 #               (ru + en) models so every container start is instant. Use for real extraction.
 #
-# BASE IMAGE NOTE: Debian Bookworm (12) is the current stable release with full
-# security support (EOL: ~2026-06 for the main suite, ~2028 for LTS).
-# Earlier versions of this Dockerfile used Bullseye to dodge a PaddlePaddle 2.6.x
-# zlib segfault (inflateReset2). That issue is fixed in PaddlePaddle 3.x (see
-# requirements-ml.txt), so we now ship on the current Debian — no archive mirror
-# hacks, no EOL package 404s.
+# BASE IMAGE NOTE: Debian Bookworm (12) is current stable with full security
+# support (EOL: ~2026-06 for the main suite, ~2028 for LTS). PaddlePaddle 3.x
+# (see requirements-ml.txt) has no Bullseye-era zlib segfault (inflateReset2) —
+# no archive mirror hacks, no EOL package 404s.
 
 FROM python:3.12-slim-bookworm
 
@@ -20,7 +18,7 @@ ARG WHISPER_MODEL=small
 # Space-separated list of faster-whisper models baked into the image. WHISPER_MODEL
 # (above) is only the runtime default; any model in this list can be selected via
 # .env (WHISPER_MODEL=medium) with no download at the first request. Default
-# "small" keeps the image as light as before; to bake medium as well (+~1.5 GB
+# "small" keeps the image light; to bake medium as well (+~1.5 GB
 # to the image, slower build), set "small medium" — without baking, a medium
 # .env value downloads it once at the first request into the hf-cache volume.
 ARG WHISPER_PRELOAD_MODELS="small"
@@ -68,8 +66,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 # Non-root user and model-cache mountpoints do not depend on source code, so
 # they live before the source layers: code edits then never re-run them.
-# (Ownership matches the previous layout: COPY runs as root, appuser only
-# needs read access to import the package.)
+# (COPY runs as root; appuser only needs read access to import the package.)
 RUN useradd --create-home appuser
 USER appuser
 ENV HOME=/home/appuser

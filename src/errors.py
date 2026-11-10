@@ -40,3 +40,11 @@ class LLMUnavailableError(AppError):
 class LLMInvalidResponseError(AppError):
     code = "llm_invalid_response"
     http_status = 502
+
+
+class DownloaderUnavailableError(AppError):
+    # yt-dlp не установлен или не запускается — проблема окружения сервера,
+    # а не входных данных: 500, а не 502 download_failed. Симметрично
+    # ToolNotFoundError у ffprobe (→ media_processing_failed).
+    code = "downloader_unavailable"
+    http_status = 500
